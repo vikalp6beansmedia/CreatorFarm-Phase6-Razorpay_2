@@ -32,10 +32,10 @@ model User {
 }
 
 model TierSettings {
-  id            String   @id @default("singleton")
-  basicPrice    Int      @default(999)
-  proPrice      Int      @default(1999)
-  currency      String   @default("INR")
+  id         String @id @default("singleton")
+  basicPrice Int    @default(999)
+  proPrice   Int    @default(1999)
+  currency   String @default("INR")
 
   // IMPORTANT: use these exact names everywhere
   razorpayBasicPlanId String?
@@ -53,6 +53,12 @@ model Subscription {
   currentPeriodEnd       DateTime?
   createdAt              DateTime @default(now())
   updatedAt              DateTime @updatedAt
+
+  // Payment logging (for webhook)
+  razorpayPaymentId String?  @unique
+  razorpayOrderId   String?
+  lastPaymentStatus String?
+  lastPaymentAt     DateTime?
 
   user User? @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
