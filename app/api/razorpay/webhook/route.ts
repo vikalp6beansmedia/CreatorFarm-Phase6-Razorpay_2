@@ -1,3 +1,4 @@
+// app/api/razorpay/webhook/route.ts
 import { NextResponse } from "next/server";
 import crypto from "crypto";
 import { prisma } from "@/lib/prisma";
@@ -5,21 +6,20 @@ import { prisma } from "@/lib/prisma";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-function verifySignature(rawBody: string, signature: string, secret: string) {
-  const expected = crypto
+function verifySignature(rawBody: string, signatureHex: string, secret: string) {
+  const expectedHex = crypto
     .createHmac("sha256", secret)
     .update(rawBody)
     .digest("hex");
 
-  if (!signature) return false;
+  // Razorpay signature is hex. Compare bytes, not ascii strings.
+  const expected = Buffer.from(expectedHex, "hex");
+  const signature = Buffer.from((signatureHex || "").trim(), "hex");
 
-  // timingSafeEqual throws if buffer lengths differ
-  if (signature.length !== expected.length) return false;
+  // timingSafeEqual throws if lengths differ
+  if (expected.length !== signature.length) return false;
 
-  return crypto.timingSafeEqual(
-    Buffer.from(expected, "utf8"),
-    Buffer.from(signature, "utf8")
-  );
+  return crypto.timingSafeEqual(expected, signature);
 }
 
 function mapPlanToTier(planId: string | null | undefined, settings: any) {
@@ -30,8 +30,9 @@ function mapPlanToTier(planId: string | null | undefined, settings: any) {
 }
 
 export async function POST(req: Request) {
+  const secret = (process.env.RAZORPAY_WEBHOOK_SECRET || "").trim();
+
   try {
-    const secret = (process.env.RAZORPAY_WEBHOOK_SECRET || "").trim();
     if (!secret) {
       return NextResponse.json(
         { error: "Missing RAZORPAY_WEBHOOK_SECRET in env" },
@@ -39,7 +40,6 @@ export async function POST(req: Request) {
       );
     }
 
-    // Razorpay sends signature in this header:
     const signature = req.headers.get("x-razorpay-signature") || "";
     const rawBody = await req.text();
 
@@ -66,24 +66,24 @@ export async function POST(req: Request) {
       },
     });
 
-    // Helpers to extract entities
     const sub = event?.payload?.subscription?.entity;
     const pay = event?.payload?.payment?.entity;
 
-    // Notes from your subscription create route (we set email + tier in notes)
     const notes = sub?.notes || pay?.notes || {};
     const email =
       notes?.app_user_email || notes?.email || notes?.user_email || null;
 
-    // ---------- SUBSCRIPTION EVENTS ----------
-    if (
-      eventType === "subscription.activated" ||
-      eventType === "subscription.resumed" ||
-      eventType === "subscription.paused" ||
-      eventType === "subscription.cancelled" ||
-      eventType === "subscription.completed" ||
-      eventType === "subscription.halted"
-    ) {
+    // ---- subscription events ----
+    const isSubEvent = [
+      "subscription.activated",
+      "subscription.resumed",
+      "subscription.paused",
+      "subscription.cancelled",
+      "subscription.completed",
+      "subscription.halted",
+    ].includes(eventType);
+
+    if (isSubEvent) {
       if (!sub?.id) {
         return NextResponse.json({ ok: true, note: "No subscription entity" });
       }
@@ -91,14 +91,13 @@ export async function POST(req: Request) {
       const planId = sub?.plan_id;
       const tier = mapPlanToTier(planId, settings);
 
-      // Upsert Subscription row
       await prisma.subscription.upsert({
         where: { razorpaySubscriptionId: sub.id },
         create: {
           razorpaySubscriptionId: sub.id,
           tier: tier as any,
           status: sub.status || eventType,
-          userId: "TEMP", // will be replaced if we can resolve user
+          userId: "TEMP",
           currentPeriodEnd: sub.current_end_at
             ? new Date(sub.current_end_at * 1000)
             : null,
@@ -112,11 +111,10 @@ export async function POST(req: Request) {
         },
       });
 
-      // If we can resolve user by email, update tier + attach userId to subscription
       if (email) {
         const user = await prisma.user.findUnique({ where: { email } });
+
         if (user) {
-          // Determine tier based on status
           const activeStatuses = new Set(["active"]);
           const cancelledStatuses = new Set([
             "cancelled",
@@ -128,8 +126,6 @@ export async function POST(req: Request) {
           let nextTier: "NONE" | "BASIC" | "PRO" = "NONE";
           if (activeStatuses.has(sub.status)) nextTier = tier as any;
           if (cancelledStatuses.has(sub.status)) nextTier = "NONE";
-
-          // paused = keep tier as-is OR set NONE (your choice). We'll keep tier as-is.
           if (sub.status === "paused") nextTier = user.tier as any;
 
           await prisma.user.update({
@@ -137,7 +133,6 @@ export async function POST(req: Request) {
             data: { tier: nextTier as any },
           });
 
-          // Attach correct userId to subscription row
           await prisma.subscription.update({
             where: { razorpaySubscriptionId: sub.id },
             data: { userId: user.id },
@@ -148,8 +143,10 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: true, handled: eventType });
     }
 
-    // ---------- PAYMENT EVENTS ----------
-    if (eventType === "payment.captured" || eventType === "payment.failed") {
+    // ---- payment events ----
+    const isPayEvent = ["payment.captured", "payment.failed"].includes(eventType);
+
+    if (isPayEvent) {
       if (!pay?.id) {
         return NextResponse.json({ ok: true, note: "No payment entity" });
       }
@@ -164,15 +161,13 @@ export async function POST(req: Request) {
         userId = user?.id || null;
       }
 
-      // Store payment info on Subscription (since there is no Payment model)
       if (razorpaySubscriptionId) {
         await prisma.subscription.updateMany({
           where: { razorpaySubscriptionId },
           data: {
             razorpayPaymentId,
             razorpayOrderId,
-            lastPaymentStatus:
-              eventType === "payment.captured" ? "paid" : "failed",
+            lastPaymentStatus: eventType === "payment.captured" ? "paid" : "failed",
             lastPaymentAt: new Date(),
             ...(eventType === "payment.captured" ? { status: "active" } : {}),
             ...(userId ? { userId } : {}),
@@ -183,7 +178,6 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: true, handled: eventType });
     }
 
-    // Ignore other events
     return NextResponse.json({ ok: true, ignored: eventType });
   } catch (e: any) {
     console.error("Webhook error:", e?.message || e);
