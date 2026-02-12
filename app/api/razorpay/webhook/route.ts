@@ -10,6 +10,7 @@ function verifySignature(rawBody: string, signature: string, secret: string) {
     .createHmac("sha256", secret)
     .update(rawBody)
     .digest("hex");
+
   return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
 }
 
@@ -25,7 +26,7 @@ export async function POST(req: Request) {
     const secret = (process.env.RAZORPAY_WEBHOOK_SECRET || "").trim();
     if (!secret) {
       return NextResponse.json(
-        { error: "Missing RAZORPAY_WEBHOOK_SECRET in .env" },
+        { error: "Missing RAZORPAY_WEBHOOK_SECRET in env" },
         { status: 500 }
       );
     }
@@ -109,7 +110,12 @@ export async function POST(req: Request) {
         if (user) {
           // Determine tier based on status
           const activeStatuses = new Set(["active"]);
-          const cancelledStatuses = new Set(["cancelled", "expired", "completed", "halted"]);
+          const cancelledStatuses = new Set([
+            "cancelled",
+            "expired",
+            "completed",
+            "halted",
+          ]);
 
           let nextTier: "NONE" | "BASIC" | "PRO" = "NONE";
           if (activeStatuses.has(sub.status)) nextTier = tier as any;
@@ -140,8 +146,6 @@ export async function POST(req: Request) {
         return NextResponse.json({ ok: true, note: "No payment entity" });
       }
 
-      const amount = pay.amount || 0;
-      const currency = pay.currency || "INR";
       const razorpayPaymentId = pay.id;
       const razorpayOrderId = pay.order_id || null;
       const razorpaySubscriptionId = pay.subscription_id || null;
@@ -152,32 +156,22 @@ export async function POST(req: Request) {
         userId = user?.id || null;
       }
 
-      // Store payment (ignore duplicates)
-      if (userId) {
-        await prisma.payment.upsert({
-          where: { razorpayPaymentId },
-          create: {
-            userId,
-            kind: razorpaySubscriptionId ? "SUBSCRIPTION" : "POST_UNLOCK",
-            amount,
-            currency,
+      // Store payment info on Subscription (since there is no Payment model)
+      if (razorpaySubscriptionId) {
+        await prisma.subscription.updateMany({
+          where: { razorpaySubscriptionId },
+          data: {
             razorpayPaymentId,
             razorpayOrderId,
-            razorpaySubscriptionId,
-            status: eventType === "payment.captured" ? "paid" : "failed",
-          },
-          update: {
-            status: eventType === "payment.captured" ? "paid" : "failed",
+            lastPaymentStatus:
+              eventType === "payment.captured" ? "paid" : "failed",
+            lastPaymentAt: new Date(),
+            ...(eventType === "payment.captured" ? { status: "active" } : {}),
+            ...(userId ? { userId } : {}),
           },
         });
-
-        // If subscription payment captured, mark subscription active
-        if (razorpaySubscriptionId && eventType === "payment.captured") {
-          await prisma.subscription.updateMany({
-            where: { razorpaySubscriptionId },
-            data: { status: "active" },
-          });
-        }
+      } else {
+        // Non-subscription payment (POST unlock etc.) — not stored because schema has no Payment table.
       }
 
       return NextResponse.json({ ok: true, handled: eventType });
@@ -187,6 +181,9 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: true, ignored: eventType });
   } catch (e: any) {
     console.error("Webhook error:", e?.message || e);
-    return NextResponse.json({ error: e?.message || "Webhook error" }, { status: 500 });
+    return NextResponse.json(
+      { error: e?.message || "Webhook error" },
+      { status: 500 }
+    );
   }
 }
