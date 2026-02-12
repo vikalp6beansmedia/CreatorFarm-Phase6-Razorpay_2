@@ -11,7 +11,15 @@ function verifySignature(rawBody: string, signature: string, secret: string) {
     .update(rawBody)
     .digest("hex");
 
-  return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
+  if (!signature) return false;
+
+  // timingSafeEqual throws if buffer lengths differ
+  if (signature.length !== expected.length) return false;
+
+  return crypto.timingSafeEqual(
+    Buffer.from(expected, "utf8"),
+    Buffer.from(signature, "utf8")
+  );
 }
 
 function mapPlanToTier(planId: string | null | undefined, settings: any) {
@@ -170,8 +178,6 @@ export async function POST(req: Request) {
             ...(userId ? { userId } : {}),
           },
         });
-      } else {
-        // Non-subscription payment (POST unlock etc.) — not stored because schema has no Payment table.
       }
 
       return NextResponse.json({ ok: true, handled: eventType });
