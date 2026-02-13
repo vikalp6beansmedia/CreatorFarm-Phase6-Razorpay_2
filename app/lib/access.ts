@@ -3,10 +3,15 @@ import { authOptions } from "@/lib/authOptions";
 
 export async function getAuthedSession() {
   const session = await getServerSession(authOptions);
-  const uid = (session as any)?.uid as string | undefined;
-  const role = String((session as any)?.role || "USER");
-  const tier = String((session as any)?.tier || "NONE");
+
+  // ✅ NextAuth puts the user id on session.user.id (from your authOptions callback)
+  const uid = (session?.user as any)?.id as string | undefined;
+
+  // ✅ tier/role also stored on session.user
+  const role = String(((session?.user as any)?.role ?? "USER"));
+  const tier = String(((session?.user as any)?.tier ?? "NONE"));
   const email = session?.user?.email || null;
+
   return { session, uid, role, tier, email };
 }
 
