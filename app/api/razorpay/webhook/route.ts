@@ -7,26 +7,23 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 function verifySignature(rawBody: string, signatureHex: string, secret: string) {
-  const expectedHex = crypto
-    .createHmac("sha256", secret)
-    .update(rawBody)
-    .digest("hex");
+  const expectedHex = crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
 
   // Razorpay signature is hex. Compare bytes, not ascii strings.
   const expected = Buffer.from(expectedHex, "hex");
   const signature = Buffer.from((signatureHex || "").trim(), "hex");
 
-  // timingSafeEqual throws if lengths differ
   if (expected.length !== signature.length) return false;
-
   return crypto.timingSafeEqual(expected, signature);
 }
 
-function mapPlanToTier(planId: string | null | undefined, settings: any) {
-  if (!planId) return "NONE";
-  if (planId === settings.razorpayBasicPlanId) return "BASIC";
-  if (planId === settings.razorpayProPlanId) return "PRO";
-  return "NONE";
+function shouldActivateTier(status: string | undefined) {
+  return (status || "").toLowerCase() === "active";
+}
+
+function shouldCancelTier(status: string | undefined) {
+  const s = (status || "").toLowerCase();
+  return ["cancelled", "expired", "completed", "halted"].includes(s);
 }
 
 export async function POST(req: Request) {
@@ -34,10 +31,7 @@ export async function POST(req: Request) {
 
   try {
     if (!secret) {
-      return NextResponse.json(
-        { error: "Missing RAZORPAY_WEBHOOK_SECRET in env" },
-        { status: 500 }
-      );
+      return NextResponse.json({ error: "Missing RAZORPAY_WEBHOOK_SECRET in env" }, { status: 500 });
     }
 
     const signature = req.headers.get("x-razorpay-signature") || "";
@@ -55,23 +49,29 @@ export async function POST(req: Request) {
     const event = JSON.parse(rawBody);
     const eventType: string = event?.event || "";
 
-    // Load plan IDs from DB so we can map plan_id => BASIC/PRO
-    const settings = await prisma.tierSettings.upsert({
-      where: { id: "singleton" },
-      create: { id: "singleton" },
-      update: {},
-      select: {
-        razorpayBasicPlanId: true,
-        razorpayProPlanId: true,
-      },
-    });
-
     const sub = event?.payload?.subscription?.entity;
     const pay = event?.payload?.payment?.entity;
 
+    // Notes can appear on subscription entity
     const notes = sub?.notes || pay?.notes || {};
-    const email =
-      notes?.app_user_email || notes?.email || notes?.user_email || null;
+    const userIdFromNotes = typeof notes?.userId === "string" ? notes.userId : null;
+    const tierFromNotes = typeof notes?.tier === "string" ? notes.tier.toUpperCase() : null;
+
+    const emailFromNotesRaw =
+      notes?.email || notes?.app_user_email || notes?.user_email || null;
+    const emailFromNotes =
+      typeof emailFromNotesRaw === "string" ? emailFromNotesRaw.toLowerCase().trim() : null;
+
+    // Resolve user (best: userId, fallback: email)
+    let userId: string | null = null;
+    if (userIdFromNotes) {
+      const u = await prisma.user.findUnique({ where: { id: userIdFromNotes }, select: { id: true } });
+      userId = u?.id ?? null;
+    }
+    if (!userId && emailFromNotes) {
+      const u = await prisma.user.findUnique({ where: { email: emailFromNotes }, select: { id: true } });
+      userId = u?.id ?? null;
+    }
 
     // ---- subscription events ----
     const isSubEvent = [
@@ -88,56 +88,42 @@ export async function POST(req: Request) {
         return NextResponse.json({ ok: true, note: "No subscription entity" });
       }
 
-      const planId = sub?.plan_id;
-      const tier = mapPlanToTier(planId, settings);
+      const tier = tierFromNotes === "BASIC" || tierFromNotes === "PRO" ? tierFromNotes : "NONE";
+      const status = sub.status || eventType;
 
+      // Upsert subscription record (do NOT write invalid userId)
       await prisma.subscription.upsert({
         where: { razorpaySubscriptionId: sub.id },
         create: {
           razorpaySubscriptionId: sub.id,
           tier: tier as any,
-          status: sub.status || eventType,
-          userId: "TEMP",
-          currentPeriodEnd: sub.current_end_at
-            ? new Date(sub.current_end_at * 1000)
-            : null,
+          status,
+          userId: userId ?? null,
+          currentPeriodEnd: sub.current_end_at ? new Date(sub.current_end_at * 1000) : null,
         },
         update: {
           tier: tier as any,
-          status: sub.status || eventType,
-          currentPeriodEnd: sub.current_end_at
-            ? new Date(sub.current_end_at * 1000)
-            : null,
+          status,
+          userId: userId ?? undefined,
+          currentPeriodEnd: sub.current_end_at ? new Date(sub.current_end_at * 1000) : null,
         },
       });
 
-      if (email) {
-        const user = await prisma.user.findUnique({ where: { email } });
-
-        if (user) {
-          const activeStatuses = new Set(["active"]);
-          const cancelledStatuses = new Set([
-            "cancelled",
-            "expired",
-            "completed",
-            "halted",
-          ]);
-
-          let nextTier: "NONE" | "BASIC" | "PRO" = "NONE";
-          if (activeStatuses.has(sub.status)) nextTier = tier as any;
-          if (cancelledStatuses.has(sub.status)) nextTier = "NONE";
-          if (sub.status === "paused") nextTier = user.tier as any;
-
-          await prisma.user.update({
-            where: { id: user.id },
-            data: { tier: nextTier as any },
-          });
-
-          await prisma.subscription.update({
-            where: { razorpaySubscriptionId: sub.id },
-            data: { userId: user.id },
-          });
+      // Update user's tier if we can resolve userId
+      if (userId) {
+        let nextTier: "NONE" | "BASIC" | "PRO" = "NONE";
+        if (shouldActivateTier(sub.status)) nextTier = tier as any;
+        if (shouldCancelTier(sub.status)) nextTier = "NONE";
+        if ((sub.status || "").toLowerCase() === "paused") {
+          // keep current tier on pause
+          const cur = await prisma.user.findUnique({ where: { id: userId }, select: { tier: true } });
+          nextTier = (cur?.tier as any) ?? "NONE";
         }
+
+        await prisma.user.update({
+          where: { id: userId },
+          data: { tier: nextTier as any },
+        });
       }
 
       return NextResponse.json({ ok: true, handled: eventType });
@@ -155,12 +141,6 @@ export async function POST(req: Request) {
       const razorpayOrderId = pay.order_id || null;
       const razorpaySubscriptionId = pay.subscription_id || null;
 
-      let userId: string | null = null;
-      if (email) {
-        const user = await prisma.user.findUnique({ where: { email } });
-        userId = user?.id || null;
-      }
-
       if (razorpaySubscriptionId) {
         await prisma.subscription.updateMany({
           where: { razorpaySubscriptionId },
@@ -173,6 +153,17 @@ export async function POST(req: Request) {
             ...(userId ? { userId } : {}),
           },
         });
+
+        // Ensure user's tier is set after first successful payment (if webhook ordering is weird)
+        if (eventType === "payment.captured" && userId) {
+          const tier = tierFromNotes === "BASIC" || tierFromNotes === "PRO" ? tierFromNotes : null;
+          if (tier) {
+            await prisma.user.update({
+              where: { id: userId },
+              data: { tier: tier as any },
+            });
+          }
+        }
       }
 
       return NextResponse.json({ ok: true, handled: eventType });
@@ -181,9 +172,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: true, ignored: eventType });
   } catch (e: any) {
     console.error("Webhook error:", e?.message || e);
-    return NextResponse.json(
-      { error: e?.message || "Webhook error" },
-      { status: 500 }
-    );
+    // return 200 so Razorpay doesn't retry infinitely while you're debugging
+    return NextResponse.json({ ok: true, error: e?.message || "Webhook error" }, { status: 200 });
   }
 }

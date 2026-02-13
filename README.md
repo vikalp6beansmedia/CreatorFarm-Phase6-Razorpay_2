@@ -36,3 +36,41 @@ npm run dev
 - No nodemailer (so no `Can't resolve 'nodemailer'`)
 - No `@/app/*` alias mistakes. All imports use `@/lib/...` which maps to `app/lib/...`
 - Uses exact Prisma column names: `razorpayBasicPlanId`, `razorpayProPlanId`
+
+
+## Phase 6+ (Auth + Razorpay + Chat)
+
+### Required env vars
+Auth:
+- NEXTAUTH_URL
+- NEXTAUTH_SECRET
+- ADMIN_EMAIL (optional, for env-admin credentials login)
+- ADMIN_PASSWORD (optional)
+
+Google OAuth:
+- GOOGLE_CLIENT_ID
+- GOOGLE_CLIENT_SECRET
+
+Magic link (SMTP):
+- EMAIL_SERVER_HOST
+- EMAIL_SERVER_PORT
+- EMAIL_SERVER_USER
+- EMAIL_SERVER_PASSWORD
+- EMAIL_FROM
+
+Razorpay:
+- RAZORPAY_KEY_ID
+- RAZORPAY_KEY_SECRET
+- RAZORPAY_WEBHOOK_SECRET
+
+DB:
+- DATABASE_URL
+
+### After pulling new schema
+Run one of these (recommended):
+- `npx prisma db push`
+- or `npx prisma migrate dev`
+
+Then:
+- `npm install`
+- `npm run dev`

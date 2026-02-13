@@ -15,9 +15,17 @@ export async function POST(req: Request) {
   try {
     // 1) Must be signed in
     const session = await getServerSession(authOptions);
-    const email = session?.user?.email;
-    if (!email) {
+    const email = session?.user?.email?.toLowerCase().trim() || "";
+    const userId = (session as any)?.uid as string | undefined;
+
+    if (!email || !userId) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    // Ensure user exists in DB (prevents FK issues later)
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, email: true } });
+    if (!user) {
+      return NextResponse.json({ error: "User not found" }, { status: 400 });
     }
 
     // 2) Read tier from body
@@ -42,8 +50,7 @@ export async function POST(req: Request) {
       },
     });
 
-    const planId =
-      tier === "BASIC" ? settings.razorpayBasicPlanId : settings.razorpayProPlanId;
+    const planId = tier === "BASIC" ? settings.razorpayBasicPlanId : settings.razorpayProPlanId;
 
     if (!planId) {
       return NextResponse.json({ error: "Missing plan id" }, { status: 400 });
@@ -52,10 +59,6 @@ export async function POST(req: Request) {
     // 4) Read Razorpay keys from env (trim!)
     const keyId = safeTrim(process.env.RAZORPAY_KEY_ID);
     const keySecret = safeTrim(process.env.RAZORPAY_KEY_SECRET);
-
-    // Helpful debug (does not leak full secret)
-    console.log("RZP KEY_ID len:", keyId.length, "starts:", keyId.slice(0, 6));
-    console.log("RZP KEY_SECRET len:", keySecret.length, "starts:", keySecret.slice(0, 4));
 
     if (!keyId || !keySecret) {
       return NextResponse.json({ error: "Missing Razorpay keys" }, { status: 500 });
@@ -68,12 +71,13 @@ export async function POST(req: Request) {
       plan_id: planId,
       customer_notify: 1,
       quantity: 1,
-      // Razorpay requires total_count
       // keep high number for ongoing monthly membership
       total_count: 120,
       notes: {
-        app_user_email: email,
+        // IMPORTANT: webhook will read this and link to correct user
+        userId,
         tier,
+        email,
       },
     };
 
@@ -109,9 +113,6 @@ export async function POST(req: Request) {
     });
   } catch (e: any) {
     console.log("Subscription route crashed:", e);
-    return NextResponse.json(
-      { error: e?.message || "Server error" },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: e?.message || "Server error" }, { status: 500 });
   }
 }
