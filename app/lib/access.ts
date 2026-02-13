@@ -4,12 +4,10 @@ import { authOptions } from "@/lib/authOptions";
 export async function getAuthedSession() {
   const session = await getServerSession(authOptions);
 
-  // ✅ NextAuth puts the user id on session.user.id (from your authOptions callback)
+  // NextAuth data lives under session.user.*
   const uid = (session?.user as any)?.id as string | undefined;
-
-  // ✅ tier/role also stored on session.user
-  const role = String(((session?.user as any)?.role ?? "USER"));
-  const tier = String(((session?.user as any)?.tier ?? "NONE"));
+  const role = String(((session?.user as any)?.role ?? "USER")).toUpperCase();
+  const tier = String(((session?.user as any)?.tier ?? "NONE")).toUpperCase();
   const email = session?.user?.email || null;
 
   return { session, uid, role, tier, email };
