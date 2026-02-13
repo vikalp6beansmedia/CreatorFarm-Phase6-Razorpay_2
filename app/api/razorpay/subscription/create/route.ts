@@ -15,15 +15,20 @@ export async function POST(req: Request) {
   try {
     // 1) Must be signed in
     const session = await getServerSession(authOptions);
+
     const email = session?.user?.email?.toLowerCase().trim() || "";
-    const userId = (session as any)?.uid as string | undefined;
+    const userId = (session?.user as any)?.id as string | undefined; // ✅ FIXED
 
     if (!email || !userId) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
     // Ensure user exists in DB (prevents FK issues later)
-    const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, email: true } });
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, email: true },
+    });
+
     if (!user) {
       return NextResponse.json({ error: "User not found" }, { status: 400 });
     }
@@ -71,10 +76,8 @@ export async function POST(req: Request) {
       plan_id: planId,
       customer_notify: 1,
       quantity: 1,
-      // keep high number for ongoing monthly membership
       total_count: 120,
       notes: {
-        // IMPORTANT: webhook will read this and link to correct user
         userId,
         tier,
         email,
@@ -104,7 +107,6 @@ export async function POST(req: Request) {
       );
     }
 
-    // 6) Return subscription + payment short_url (if available)
     return NextResponse.json({
       subscriptionId: rpJson.id,
       status: rpJson.status,
